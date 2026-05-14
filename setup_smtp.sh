@@ -1,202 +1,260 @@
-#!/bin/bash
+#!/usr/bin/env bash
 #
-# setup-smtp.sh — Complete SMTP Server Setup Script
-# Targets: Ubuntu 22.04 / 24.04 LTS on Hetzner, Contabo, or similar VPS
-# Run as root: sudo bash setup-smtp.sh
+# setup-smtp-corrected.sh — Postfix + OpenDKIM + SMTP AUTH + MTA-STS/TLS-RPT helper
+# Targets: Ubuntu 22.04 / 24.04 LTS
+# Run: sudo bash setup-smtp-corrected.sh
 #
-set -e
+# IMPORTANT:
+# 1) Edit DOMAIN and ADMIN_EMAIL first.
+# 2) Create DNS A records before running certbot parts:
+#      mail.DOMAIN    -> this server IP
+#      mta-sts.DOMAIN -> this server IP
+# 3) Set VPS rDNS/PTR to mail.DOMAIN in your provider panel.
+#
+set -Eeuo pipefail
 
 # ──────────────────────────────────────────────────────────────────────
 # CONFIGURATION — EDIT THESE BEFORE RUNNING
 # ──────────────────────────────────────────────────────────────────────
-DOMAIN="pantwestconsultant.net"               # Your domain (must own DNS)
-HOSTNAME="mail.${DOMAIN}"             # Server FQDN — set rDNS to this
-SELECTOR="mail"                       # DKIM selector (can be anything)
-ADMIN_EMAIL="contact@${DOMAIN}"         # Where system mail goes
+DOMAIN="panwestconsultant.net"
+HOSTNAME="mail.${DOMAIN}"
+MTA_STS_HOST="mta-sts.${DOMAIN}"
+SELECTOR="mail"
+ADMIN_EMAIL="contact@${DOMAIN}"
+SMTP_USER="smtpuser"
+SMTP_PASSWORD="CHANGE_ME_STRONG_PASSWORD_NOW"
+MTA_STS_MODE="enforce"       # use testing first if you are unsure; enforce after validation
+MTA_STS_MAX_AGE="86400"      # 1 day initially; later use 31557600
+ENABLE_NGINX_MTA_STS="yes"   # yes/no
+ENABLE_465="yes"             # yes/no. 587 is the recommended main submission port.
 # ──────────────────────────────────────────────────────────────────────
 
-# Colors for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+SERVER_IP="$(ip route get 1 | awk '{print $7; exit}')"
 
-echo -e "${GREEN}========================================${NC}"
-echo -e "${GREEN}  SMTP Server Setup for ${DOMAIN}${NC}"
-echo -e "${GREEN}========================================${NC}"
+log(){ echo -e "\n${YELLOW}$*${NC}"; }
+ok(){ echo -e "${GREEN}$*${NC}"; }
+fail(){ echo -e "${RED}$*${NC}" >&2; exit 1; }
 
-# ── 1. System Updates & Hostname ────────────────────────────────────
-echo -e "\n${YELLOW}[1/8] Setting hostname and updating system...${NC}"
+[[ $EUID -eq 0 ]] || fail "Run as root: sudo bash $0"
+[[ "$SMTP_PASSWORD" != "CHANGE_ME_STRONG_PASSWORD_NOW" ]] || fail "Edit SMTP_PASSWORD in the script before running. Do not use the default."
 
+ok "========================================"
+ok " SMTP Server Setup for ${DOMAIN}"
+ok " IP: ${SERVER_IP}"
+ok "========================================"
+
+# ── 1. Hostname and packages ─────────────────────────────────────────
+log "[1/11] Setting hostname and installing packages..."
 hostnamectl set-hostname "${HOSTNAME}"
 echo "${HOSTNAME}" > /etc/hostname
-
-# Add to /etc/hosts if not already there
-if ! grep -q "${HOSTNAME}" /etc/hosts; then
-    # Get primary IP
-    IP=$(ip route get 1 | awk '{print $7; exit}')
-    echo "${IP} ${HOSTNAME} ${DOMAIN}" >> /etc/hosts
+if ! grep -qE "\s${HOSTNAME}(\s|$)" /etc/hosts; then
+  echo "${SERVER_IP} ${HOSTNAME} ${DOMAIN}" >> /etc/hosts
 fi
 
-apt-get update -qq && apt-get upgrade -y -qq
-
-# ── 2. Install Packages ─────────────────────────────────────────────
-echo -e "\n${YELLOW}[2/8] Installing Postfix, OpenDKIM, and deps...${NC}"
-
-# Pre-seed Postfix config to avoid interactive prompts
+export DEBIAN_FRONTEND=noninteractive
 debconf-set-selections <<< "postfix postfix/mailname string ${HOSTNAME}"
 debconf-set-selections <<< "postfix postfix/main_mailer_type string 'Internet Site'"
 
-apt-get install -y -qq \
-    postfix \
-    postfix-policyd-spf-python \
-    opendkim \
-    opendkim-tools \
-    libsasl2-modules \
-    bind9-dnsutils \
-    mailutils \
-    certbot
+apt-get update -y
+apt-get install -y postfix postfix-policyd-spf-python opendkim opendkim-tools \
+  sasl2-bin libsasl2-modules bind9-dnsutils mailutils certbot nginx python3-certbot-nginx \
+  ca-certificates openssl ufw fail2ban
 
-# ── 3. Configure Postfix (Send-Only, Secure) ────────────────────────
-echo -e "\n${YELLOW}[3/8] Configuring Postfix...${NC}"
+# ── 2. Certificates ──────────────────────────────────────────────────
+log "[2/11] Getting/validating Let's Encrypt certificates..."
+# Certbot standalone needs port 80 free if nginx has no working site yet.
+if [[ ! -d "/etc/letsencrypt/live/${HOSTNAME}" ]]; then
+  systemctl stop nginx 2>/dev/null || true
+  certbot certonly --standalone --non-interactive --agree-tos -m "${ADMIN_EMAIL}" -d "${HOSTNAME}" || \
+    fail "Could not issue cert for ${HOSTNAME}. Make sure DNS A record points to ${SERVER_IP} and port 80 is reachable."
+  systemctl start nginx 2>/dev/null || true
+fi
 
-cat > /etc/postfix/main.cf << 'POSTFIX_EOF'
-# ── Basic ───────────────────────────────────────────
-smtpd_banner = $myhostname ESMTP
+# ── 3. Postfix main.cf ───────────────────────────────────────────────
+log "[3/11] Writing Postfix main.cf..."
+cp -a /etc/postfix/main.cf "/etc/postfix/main.cf.bak.$(date +%s)" 2>/dev/null || true
+cat > /etc/postfix/main.cf <<EOF_MAIN
+# Basic
+smtpd_banner = \$myhostname ESMTP
 biff = no
 append_dot_mydomain = no
 readme_directory = no
 compatibility_level = 3.6
 
-# ── Hostname & Domain ───────────────────────────────
-myhostname = MAILHOSTNAME_PLACEHOLDER
-mydomain = DOMAIN_PLACEHOLDER
-myorigin = $mydomain
-mydestination = $myhostname, localhost.$mydomain, localhost
-
-# ── Send-Only (loopback-only for inbound) ───────────
+# Identity
+myhostname = ${HOSTNAME}
+mydomain = ${DOMAIN}
+myorigin = \$mydomain
+mydestination = \$myhostname, localhost.\$mydomain, localhost
 inet_interfaces = all
 inet_protocols = ipv4
-
-# ── Outbound Relay — Direct Delivery ────────────────
 relayhost =
-# No smarthost — deliver directly via DNS MX records
 
-# ── TLS: Always encrypt outbound ────────────────────
+# TLS outbound delivery
 smtp_tls_security_level = may
 smtp_tls_loglevel = 1
-smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache
+smtp_tls_session_cache_database = btree:\${data_directory}/smtp_scache
 smtp_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
 smtp_tls_mandatory_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
 smtp_tls_mandatory_ciphers = medium
 
-# ── Message Size ────────────────────────────────────
+# TLS inbound/submission
+smtpd_tls_cert_file = /etc/letsencrypt/live/${HOSTNAME}/fullchain.pem
+smtpd_tls_key_file = /etc/letsencrypt/live/${HOSTNAME}/privkey.pem
+smtpd_tls_security_level = may
+smtpd_tls_auth_only = yes
+smtpd_tls_protocols = >=TLSv1.2
+smtpd_tls_mandatory_protocols = >=TLSv1.2
+smtpd_tls_loglevel = 1
+
+# SMTP AUTH — this exact combo fixed Gammadyne auth
+smtpd_sasl_type = cyrus
+smtpd_sasl_path = smtpd
+smtpd_sasl_auth_enable = yes
+broken_sasl_auth_clients = yes
+smtpd_sasl_mechanism_filter = plain, login
+smtpd_sasl_security_options = noanonymous
+smtpd_sasl_tls_security_options = noanonymous
+
+# Message limits
 message_size_limit = 25600000
 
-# ── DKIM Milter ────────────────────────────────────
+# DKIM milter
 milter_default_action = accept
 milter_protocol = 6
 smtpd_milters = inet:127.0.0.1:8891
 non_smtpd_milters = inet:127.0.0.1:8891
 
-# ── SPF Policy Agent ───────────────────────────────
+# Recipient restrictions / anti-open-relay
 policyd-spf_time_limit = 3600
-smtpd_recipient_restrictions =
-    permit_mynetworks,
-    permit_sasl_authenticated,
-    reject_unauth_destination,
-    check_policy_service unix:private/policyd-spf
+smtpd_recipient_restrictions = permit_mynetworks, permit_sasl_authenticated, reject_unauth_destination, check_policy_service unix:private/policyd-spf
 
-# ── Rate Limits (prevents abuse spikes) ────────────
-default_destination_concurrency_limit = 20
-default_destination_recipient_limit = 50
-smtp_destination_concurrency_limit = 10
-smtp_extra_connection_limit = 5
-POSTFIX_EOF
+# Conservative outbound rate controls for warm-up; adjust later carefully
+initial_destination_concurrency = 2
+default_destination_concurrency_limit = 10
+default_destination_recipient_limit = 20
+smtp_destination_concurrency_limit = 5
+smtp_destination_rate_delay = 2s
+smtp_extra_recipient_limit = 20
+anvil_rate_time_unit = 60s
+smtpd_client_connection_rate_limit = 30
+smtpd_client_message_rate_limit = 60
 
-# Substitute placeholders
-sed -i "s/MAILHOSTNAME_PLACEHOLDER/${HOSTNAME}/g" /etc/postfix/main.cf
-sed -i "s/DOMAIN_PLACEHOLDER/${DOMAIN}/g" /etc/postfix/main.cf
+# Hide local username leaks less often
+local_header_rewrite_clients = static:all
+EOF_MAIN
 
-# ── Configure SPF policy agent ─────────────────────
-cat > /etc/postfix-policyd-spf-python/policyd-spf.conf << 'SPF_EOF'
-# SPF Policy configuration
-HELO_reject = False
-Mail_From_reject = False
-SPF_Not_Pass = reject
-SPF_Not_Pass_Defer = False
-SPF_Not_Pass_Reject_Defer = False
-SPF_Not_Pass_Temp_Error_Defer = False
-SPF_Pass_Good_Enough = True
-SPF_Guess = v=spf1 a mx ~all
-SPF_Internal_IPs = 127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16
-SPF_Default_Policy_For_Unknown_Helo_Scoring = 0.0
-SPF_Default_Policy_For_Unknown_MailFrom_Scoring = 3.0
-SPF_Default_Whitelist_Scoring = 0.0
-SPF_Minimum_Score_For_Rejection = 4.0
-SPF_Expand_Limit = 5
-SPF_Max_DNS_Requests = 20
-SPF_Enabled_On_Startup = True
-SPF_Policy_Enabled = True
-SPF_Log_Level = 1
-SPF_Milter_Log_Level = 1
-SPF_Sender_Config = True
-SPF_Helo_Config = True
-SPF_Reject_Code = 550
-SPF_Reject_Message = Rejected due to SPF failure
-SPF_Defer_Message = Temporarily rejected due to SPF failure
-SPF_Defer_Code = 450
-SPF_Milter_Defer_Code = 450
-SPF_Milter_Reject_Code = 550
-SPF_Milter_Reject_Message = Rejected due to SPF failure
-SPF_Policy_Per_Domain = True
-SPF_Domain_Policy_File = /etc/postfix-policyd-spf-python/spf_domain_policy
-SPF_Policy_Default_Domain_Policy = ~all
-SPF_Policy_Default_Domain_Reject_Message = Rejected due to SPF failure
-SPF_Policy_Default_Domain_Defer_Message = Temporarily rejected due to SPF failure
-SPF_Policy_Default_Domain_Reject_Code = 550
-SPF_Policy_Default_Domain_Defer_Code = 450
-SPF_Policy_Default_Domain_Reject_Reason = SPF check failed
-SPF_Policy_Default_Domain_Defer_Reason = SPF check deferred
-SPF_Policy_Default_Domain_Reject_Defer_Reason = SPF check deferred/rejected
-SPF_Policy_Default_Domain_Reject_Defer_Code = 450
-SPF_Policy_Default_Domain_Reject_Defer_Message = Temporarily rejected due to SPF failure
-SPF_Policy_Default_Domain_Reject_Defer_Defer_Message = Temporarily rejected due to SPF failure
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Message = Rejected due to SPF failure
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Code = 550
-SPF_Policy_Default_Domain_Reject_Defer_Defer_Code = 450
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Reason = SPF check failed
-SPF_Policy_Default_Domain_Reject_Defer_Defer_Reason = SPF check deferred
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Defer_Reason = SPF check deferred/rejected
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Defer_Code = 450
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Defer_Message = Temporarily rejected due to SPF failure
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Defer_Reject_Message = Rejected due to SPF failure
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Defer_Reject_Code = 550
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Defer_Defer_Code = 450
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Defer_Reject_Reason = SPF check failed
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Defer_Defer_Reason = SPF check deferred
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Defer_Reject_Defer_Reason = SPF check deferred/rejected
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Defer_Reject_Defer_Code = 450
-SPF_Policy_Default_Domain_Reject_Defer_Reject_Defer_Reject_Defer_Message = Temporarily rejected due to SPF failure
-SPF_EOF
+# ── 4. Postfix master.cf — clean service definitions ─────────────────
+log "[4/11] Writing safe Postfix master.cf..."
+cp -a /etc/postfix/master.cf "/etc/postfix/master.cf.bak.$(date +%s)" 2>/dev/null || true
+cat > /etc/postfix/master.cf <<'EOF_MASTER'
+# service type  private unpriv  chroot  wakeup  maxproc command + args
+smtp      inet  n       -       y       -       -       smtpd
+pickup    unix  n       -       y       60      1       pickup
+cleanup   unix  n       -       y       -       0       cleanup
+qmgr      unix  n       -       n       300     1       qmgr
+tlsmgr    unix  -       -       y       1000?   1       tlsmgr
+rewrite   unix  -       -       y       -       -       trivial-rewrite
+bounce    unix  -       -       y       -       0       bounce
+defer     unix  -       -       y       -       0       bounce
+trace     unix  -       -       y       -       0       bounce
+verify    unix  -       -       y       -       1       verify
+flush     unix  n       -       y       1000?   0       flush
+proxymap  unix  -       -       n       -       -       proxymap
+proxywrite unix -       -       n       -       1       proxymap
+smtp      unix  -       -       y       -       -       smtp
+relay     unix  -       -       y       -       -       smtp
+showq     unix  n       -       y       -       -       showq
+error     unix  -       -       y       -       -       error
+retry     unix  -       -       y       -       -       error
+discard   unix  -       -       y       -       -       discard
+local     unix  -       n       n       -       -       local
+virtual   unix  -       n       n       -       -       virtual
+lmtp      unix  -       -       y       -       -       lmtp
+anvil     unix  -       -       y       -       1       anvil
+scache    unix  -       -       y       -       1       scache
+postlog   unix-dgram n  -       n       -       1       postlogd
 
-# Add SPF policy to master.cf
-if ! grep -q "policyd-spf" /etc/postfix/master.cf; then
-    cat >> /etc/postfix/master.cf << 'MASTER_SPF_EOF'
+# Port 587: authenticated mail submission. chroot = n so it can access /run/saslauthd/mux.
+submission inet n       -       n       -       -       smtpd
+  -o syslog_name=postfix/submission
+  -o smtpd_tls_security_level=encrypt
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+  -o milter_macro_daemon_name=ORIGINATING
+
+# Port 465: optional SMTPS. Some providers block this externally; 587 is the main port.
+smtps     inet  n       -       n       -       -       smtpd
+  -o syslog_name=postfix/smtps
+  -o smtpd_tls_wrappermode=yes
+  -o smtpd_sasl_auth_enable=yes
+  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject
+  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
+  -o milter_macro_daemon_name=ORIGINATING
 
 # SPF policy agent
 policyd-spf  unix  -       n       n       -       0       spawn
     user=policyd-spf argv=/usr/bin/policyd-spf
-MASTER_SPF_EOF
+EOF_MASTER
+
+if [[ "${ENABLE_465}" != "yes" ]]; then
+  sed -i '/^smtps /,/^$/ s/^/#/' /etc/postfix/master.cf
 fi
 
-# ── 4. Configure OpenDKIM ──────────────────────────────────────────
-echo -e "\n${YELLOW}[4/8] Configuring OpenDKIM...${NC}"
+# ── 5. Cyrus SASL / saslauthd ────────────────────────────────────────
+log "[5/11] Configuring Cyrus SASL and saslauthd..."
+cat > /etc/default/saslauthd <<'EOF_SASLAUTHD'
+START=yes
+DESC="SASL Authentication Daemon"
+NAME="saslauthd"
+MECHANISMS="pam"
+MECH_OPTIONS=""
+THREADS=5
+OPTIONS="-c -m /run/saslauthd"
+EOF_SASLAUTHD
 
-mkdir -p /etc/opendkim/keys/${DOMAIN}
+# This was the final fix: Postfix/Cyrus was trying /etc/sasldb2 until this file existed here.
+mkdir -p /usr/lib/sasl2 /etc/postfix/sasl
+cat > /usr/lib/sasl2/smtpd.conf <<'EOF_SASL'
+pwcheck_method: saslauthd
+mech_list: PLAIN LOGIN
+saslauthd_path: /run/saslauthd/mux
+EOF_SASL
+cp /usr/lib/sasl2/smtpd.conf /etc/postfix/sasl/smtpd.conf
+chmod 644 /usr/lib/sasl2/smtpd.conf /etc/postfix/sasl/smtpd.conf
 
-cat > /etc/opendkim.conf << 'DKIM_EOF'
-# OpenDKIM configuration
+mkdir -p /run/saslauthd
+chown root:sasl /run/saslauthd || true
+chmod 710 /run/saslauthd || true
+
+if id "${SMTP_USER}" >/dev/null 2>&1; then
+  echo "${SMTP_USER}:${SMTP_PASSWORD}" | chpasswd
+else
+  adduser "${SMTP_USER}" --disabled-password --gecos "SMTP User"
+  echo "${SMTP_USER}:${SMTP_PASSWORD}" | chpasswd
+fi
+
+systemctl enable saslauthd
+systemctl restart saslauthd
+
+testsaslauthd -u "${SMTP_USER}" -p "${SMTP_PASSWORD}" || fail "saslauthd test failed"
+
+# ── 6. SPF policyd minimal config ────────────────────────────────────
+log "[6/11] Configuring SPF policy agent..."
+cat > /etc/postfix-policyd-spf-python/policyd-spf.conf <<'EOF_SPF'
+HELO_reject = False
+Mail_From_reject = False
+SPF_Not_Pass = False
+SPF_Pass_Good_Enough = True
+SPF_Log_Level = 1
+EOF_SPF
+
+# ── 7. OpenDKIM ─────────────────────────────────────────────────────
+log "[7/11] Configuring OpenDKIM..."
+mkdir -p "/etc/opendkim/keys/${DOMAIN}"
+cat > /etc/opendkim.conf <<'EOF_DKIMCONF'
 Syslog                  yes
 UMask                   002
 LogWhy                  yes
@@ -214,526 +272,174 @@ SigningTable            refile:/etc/opendkim/SigningTable
 SignatureAlgorithm      rsa-sha256
 Socket                  inet:8891@127.0.0.1
 PidFile                 /run/opendkim/opendkim.pid
-DKIM_EOF
+EOF_DKIMCONF
 
-# Generate DKIM keys
-cd /etc/opendkim/keys/${DOMAIN}
-opendkim-genkey -D /etc/opendkim/keys/${DOMAIN}/ -d ${DOMAIN} -s ${SELECTOR} -b 2048
-chown -R opendkim:opendkim /etc/opendkim
+if [[ ! -f "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private" ]]; then
+  opendkim-genkey -D "/etc/opendkim/keys/${DOMAIN}/" -d "${DOMAIN}" -s "${SELECTOR}" -b 2048
+fi
 
-# KeyTable
-cat > /etc/opendkim/KeyTable << KEYTABLE_EOF
+cat > /etc/opendkim/KeyTable <<EOF_KEYTABLE
 ${SELECTOR}._domainkey.${DOMAIN} ${DOMAIN}:${SELECTOR}:/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private
-KEYTABLE_EOF
+EOF_KEYTABLE
 
-# SigningTable
-cat > /etc/opendkim/SigningTable << SIGNINGTABLE_EOF
+cat > /etc/opendkim/SigningTable <<EOF_SIGNING
 *@${DOMAIN} ${SELECTOR}._domainkey.${DOMAIN}
-SIGNINGTABLE_EOF
+EOF_SIGNING
 
-# TrustedHosts
-cat > /etc/opendkim/TrustedHosts << TRUSTED_EOF
+cat > /etc/opendkim/TrustedHosts <<EOF_TRUSTED
 127.0.0.1
 ::1
 localhost
 ${DOMAIN}
 ${HOSTNAME}
-TRUSTED_EOF
+EOF_TRUSTED
 
-# ── 5. Restart Services ────────────────────────────────────────────
-echo -e "\n${YELLOW}[5/8] Restarting services...${NC}"
+# DKIM permissions discovered during debugging:
+# parent dirs root-owned; private key root-owned when opendkim runs as uid 0 on this build.
+chown root:root /etc/opendkim /etc/opendkim/keys "/etc/opendkim/keys/${DOMAIN}" /etc/opendkim/KeyTable /etc/opendkim/SigningTable /etc/opendkim/TrustedHosts /etc/opendkim.conf
+chmod 755 /etc/opendkim /etc/opendkim/keys "/etc/opendkim/keys/${DOMAIN}"
+chmod 644 /etc/opendkim/KeyTable /etc/opendkim/SigningTable /etc/opendkim/TrustedHosts /etc/opendkim.conf
+chown root:root "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private"
+chmod 600 "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.private"
+[[ -f "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt" ]] && chmod 644 "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt"
 
 systemctl enable opendkim
 systemctl restart opendkim
-systemctl restart postfix
 
-
- chown root:root /etc
- chmod 755 /etc
-
- chown root:root /etc/opendkim
- chmod 755 /etc/opendkim
-
- chown root:root /etc/opendkim/keys
- chmod 755 /etc/opendkim/keys
-
- chown opendkim:opendkim /etc/opendkim/keys/panwestconsultant.net
- chmod 750 /etc/opendkim/keys/panwestconsultant.net
-
- chown opendkim:opendkim /etc/opendkim/keys/panwestconsultant.net/mail.private
- chmod 600 /etc/opendkim/keys/panwestconsultant.net/mail.private
-
-
-
- chown root:root /etc/opendkim/keys/panwestconsultant.net
- chmod 755 /etc/opendkim/keys/panwestconsultant.net
-
- chown opendkim:opendkim /etc/opendkim/keys/panwestconsultant.net/mail.private
- chmod 600 /etc/opendkim/keys/panwestconsultant.net/mail.private
-
- systemctl restart opendkim
- systemctl restart postfix
-
-
-# ── 6. nginx configuration ────────────────────────────────────────────
-echo -e "\n${YELLOW}[6/8]Installing nginx and configuring MTA-STS...${NC}"
-
-sudo apt update
-sudo apt install nginx certbot python3-certbot-nginx -y
-sudo mkdir -p /var/www/mta-sts/.well-known
-
-cat > /var/www/mta-sts/.well-known/mta-sts.txt << MTA_STS_EOF
+# ── 8. MTA-STS policy site ──────────────────────────────────────────
+if [[ "${ENABLE_NGINX_MTA_STS}" == "yes" ]]; then
+  log "[8/11] Configuring MTA-STS policy website..."
+  mkdir -p /var/www/mta-sts/.well-known
+  cat > /var/www/mta-sts/.well-known/mta-sts.txt <<EOF_STS
 version: STSv1
-mode: enforce
+mode: ${MTA_STS_MODE}
 mx: ${HOSTNAME}
-max_age: 86400
-MTA_STS_EOF     
+max_age: ${MTA_STS_MAX_AGE}
+EOF_STS
 
-#-7. Create nginx config for MTA-STS
-echo -e "\n${YELLOW}[7/8]Create nginx config for MTA-STS...${NC}"
-
-cat > /etc/nginx/sites-available/mta-sts.conf << NGINX_MTA_EOF
+  cat > /etc/nginx/sites-available/mta-sts.conf <<EOF_NGINX
 server {
     listen 80;
-    server_name mta-sts.${DOMAIN};
-
+    server_name ${MTA_STS_HOST};
     root /var/www/mta-sts;
-
     location /.well-known/mta-sts.txt {
         default_type text/plain;
+        try_files \$uri =404;
     }
 }
-NGINX_MTA_EOF
-ln -s /etc/nginx/sites-available/mta-sts.conf /etc/nginx/sites-enabled/mta-sts.conf
-nginx -t && systemctl reload nginx
-
-sudo certbot --nginx -d mta-sts.${DOMAIN} --non-interactive --agree-tos -m ${ADMIN_EMAIL}
-
-
-# ── 8. Display DKIM Public Key ─────────────────────────────────────
-echo -e "\n${YELLOW}[8/8] DKIM public key — add this to your DNS:${NC}"
-echo -e "${GREEN}=====================================================${NC}"
-cat /etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt
-echo -e "${GREEN}=====================================================${NC}"
-
-# ── 9. Firewall Rules ──────────────────────────────────────────────
-echo -e "\n${YELLOW}[9/8] Configuring firewall...${NC}"
-
-# Check for ufw
-if command -v ufw &> /dev/null; then
-    ufw allow 25/tcp
-    ufw allow 465/tcp
-    ufw allow 587/tcp
-    echo "UFW rules added for ports 25, 465, 587"
+EOF_NGINX
+  ln -sfn /etc/nginx/sites-available/mta-sts.conf /etc/nginx/sites-enabled/mta-sts.conf
+  nginx -t
+  systemctl reload nginx || systemctl restart nginx
+  if [[ ! -d "/etc/letsencrypt/live/${MTA_STS_HOST}" ]]; then
+    certbot --nginx --non-interactive --agree-tos -m "${ADMIN_EMAIL}" -d "${MTA_STS_HOST}" || \
+      echo -e "${YELLOW}MTA-STS cert failed. Add DNS A record mta-sts.${DOMAIN} -> ${SERVER_IP}, then run certbot again.${NC}"
+  fi
 fi
 
-# Also check for iptables/nftables fallback (common on Hetzner)
-if ! command -v ufw &> /dev/null; then
-    echo "UFW not found. Ensure your VPS firewall (Hetzner/Contabo panel) allows:"
-    echo "  - Inbound TCP 25, 465, 587"
-    echo "  - Outbound TCP 25 (may be blocked — see notes below)"
+# ── 9. Firewall + fail2ban ──────────────────────────────────────────
+log "[9/11] Opening firewall ports and enabling fail2ban..."
+if command -v ufw >/dev/null 2>&1; then
+  ufw allow 25/tcp || true
+  ufw allow 587/tcp || true
+  [[ "${ENABLE_465}" == "yes" ]] && ufw allow 465/tcp || true
+  ufw allow 80/tcp || true
+  ufw allow 443/tcp || true
 fi
+systemctl enable fail2ban || true
+systemctl restart fail2ban || true
 
+# ── 10. Restart and verify ──────────────────────────────────────────
+log "[10/11] Restarting services and verifying..."
+postfix check
+systemctl restart postfix
+systemctl restart opendkim
+systemctl restart saslauthd
 
-# ── 1 adding users to smtp ─────────────────────────────────────────────
-echo -e "\n${YELLOW}[1/8] adding users to smtp... ${NC}"
-echo -e "\n${YELLOW}installing packages... ${NC}"
-sudo apt update
-sudo apt install sasl2-bin libsasl2-modules -y
+opendkim-testkey -d "${DOMAIN}" -s "${SELECTOR}" -vvv || true
+ss -tulpn | grep -E ':25|:587|:465' || true
 
-# ---2 enable postfix sasl authentication
-echo -e "\n${YELLOW}[2/8] enabling postfix submission service... ${NC}"
-cat >> /etc/postfix/master.cf << EOF
-#
-# Postfix master process configuration file.  For details on the format
-# of the file, see the master(5) manual page (command: "man 5 master" or
-# on-line: http://www.postfix.org/master.5.html).
-#
-# Do not forget to execute "postfix reload" after editing this file.
-#
-# ==========================================================================
-# service type  private unpriv  chroot  wakeup  maxproc command + args
-#               (yes)   (yes)   (no)    (never) (100)
-smtps     inet  n       -       y       -       -       smtpd
-  -o syslog_name=postfix/smtps
-  -o smtpd_tls_wrappermode=yes
-  -o smtpd_sasl_auth_enable=yes
-  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject
-  -o milter_macro_daemon_name=ORIGINATING
-# ==========================================================================
-smtp      inet  n       -       y       -       -       smtpd
-#smtp      inet  n       -       y       -       1       postscreen
-#smtpd     pass  -       -       y       -       -       smtpd
-#dnsblog   unix  -       -       y       -       0       dnsblog
-#tlsproxy  unix  -       -       y       -       0       tlsproxy
-# Choose one: enable submission for loopback clients only, or for any client.
-#127.0.0.1:submission inet n -   y       -       -       smtpd
-submission inet n       -       y       -       -       smtpd
-  -o syslog_name=postfix/submission
-  -o smtpd_tls_security_level=encrypt
-  -o smtpd_sasl_auth_enable=yes
-#  -o smtpd_tls_auth_only=yes
-#  -o local_header_rewrite_clients=static:all
-#  -o smtpd_reject_unlisted_recipient=no
-#     Instead of specifying complex smtpd_<xxx>_restrictions here,
-#     specify "smtpd_<xxx>_restrictions=$mua_<xxx>_restrictions"
-#     here, and specify mua_<xxx>_restrictions in main.cf (where
-#     "<xxx>" is "client", "helo", "sender", "relay", or "recipient").
-  -o smtpd_client_restrictions=permit_sasl_authenticated,reject
-#  -o smtpd_helo_restrictions=
-#  -o smtpd_sender_restrictions=
-#  -o smtpd_relay_restrictions=
-#  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject
-  -o smtpd_sender_login_maps=
-  -o milter_macro_daemon_name=ORIGINATING
-# Choose one: enable submissions for loopback clients only, or for any client.
-#127.0.0.1:submissions inet n  -       y       -       -       smtpd
-#submissions     inet  n       -       y       -       -       smtpd
-#  -o syslog_name=postfix/submissions
-#  -o smtpd_tls_wrappermode=yes
-#  -o smtpd_sasl_auth_enable=yes
-#  -o local_header_rewrite_clients=static:all
-#  -o smtpd_reject_unlisted_recipient=no
-#     Instead of specifying complex smtpd_<xxx>_restrictions here,
-#     specify "smtpd_<xxx>_restrictions=$mua_<xxx>_restrictions"
-#     here, and specify mua_<xxx>_restrictions in main.cf (where
-#     "<xxx>" is "client", "helo", "sender", "relay", or "recipient").
-#  -o smtpd_client_restrictions=
-#  -o smtpd_helo_restrictions=
-#  -o smtpd_sender_restrictions=
-#  -o smtpd_relay_restrictions=
-#  -o smtpd_recipient_restrictions=permit_sasl_authenticated,reject
-#  -o milter_macro_daemon_name=ORIGINATING
-#628       inet  n       -       y       -       -       qmqpd
-pickup    unix  n       -       y       60      1       pickup
-cleanup   unix  n       -       y       -       0       cleanup
-qmgr      unix  n       -       n       300     1       qmgr
-#qmgr     unix  n       -       n       300     1       oqmgr
-tlsmgr    unix  -       -       y       1000?   1       tlsmgr
-rewrite   unix  -       -       y       -       -       trivial-rewrite
-bounce    unix  -       -       y       -       0       bounce
-defer     unix  -       -       y       -       0       bounce
-trace     unix  -       -       y       -       0       bounce
-verify    unix  -       -       y       -       1       verify
-flush     unix  n       -       y       1000?   0       flush
-proxymap  unix  -       -       n       -       -       proxymap
-proxywrite unix -       -       n       -       1       proxymap
-smtp      unix  -       -       y       -       -       smtp
-relay     unix  -       -       y       -       -       smtp
-        -o syslog_name=${multi_instance_name?{$multi_instance_name}:{postfix}}/$service_name
-#       -o smtp_helo_timeout=5 -o smtp_connect_timeout=5
-showq     unix  n       -       y       -       -       showq
-error     unix  -       -       y       -       -       error
-retry     unix  -       -       y       -       -       error
-discard   unix  -       -       y       -       -       discard
-local     unix  -       n       n       -       -       local
-virtual   unix  -       n       n       -       -       virtual
-lmtp      unix  -       -       y       -       -       lmtp
-anvil     unix  -       -       y       -       1       anvil
-scache    unix  -       -       y       -       1       scache
-postlog   unix-dgram n  -       n       -       1       postlogd
-#
-# ====================================================================
-# Interfaces to non-Postfix software. Be sure to examine the manual
-# pages of the non-Postfix software to find out what options it wants.
-#
-# Many of the following services use the Postfix pipe(8) delivery
-# agent.  See the pipe(8) man page for information about ${recipient}
-# and other message envelope options.
-# ====================================================================
-#
-# maildrop. See the Postfix MAILDROP_README file for details.
-# Also specify in main.cf: maildrop_destination_recipient_limit=1
-#
-#maildrop  unix  -       n       n       -       -       pipe
-#  flags=DRXhu user=vmail argv=/usr/bin/maildrop -d ${recipient}
-#
-# ====================================================================
-#
-# Recent Cyrus versions can use the existing "lmtp" master.cf entry.
-#
-# Specify in cyrus.conf:
-#   lmtp    cmd="lmtpd -a" listen="localhost:lmtp" proto=tcp4
-#
-# Specify in main.cf one or more of the following:
-#  mailbox_transport = lmtp:inet:localhost
-#  virtual_transport = lmtp:inet:localhost
-#
-# ====================================================================
-#
-# Cyrus 2.1.5 (Amos Gouaux)
-# Also specify in main.cf: cyrus_destination_recipient_limit=1
-#
-#cyrus     unix  -       n       n       -       -       pipe
-#  flags=DRX user=cyrus argv=/cyrus/bin/deliver -e -r ${sender} -m ${extension} ${user}
-#
-# ====================================================================
-#
-# Old example of delivery via Cyrus.
-#
-#old-cyrus unix  -       n       n       -       -       pipe
-#  flags=R user=cyrus argv=/cyrus/bin/deliver -e -m ${extension} ${user}
-#
-# ====================================================================
-#
-# See the Postfix UUCP_README file for configuration details.
-#
-#uucp      unix  -       n       n       -       -       pipe
-#  flags=Fqhu user=uucp argv=uux -r -n -z -a$sender - $nexthop!rmail ($recipient)
-#
-# ====================================================================
-#
-# Other external delivery methods.
-#
-#ifmail    unix  -       n       n       -       -       pipe
-#  flags=F user=ftn argv=/usr/lib/ifmail/ifmail -r $nexthop ($recipient)
-#
-#bsmtp     unix  -       n       n       -       -       pipe
-#  flags=Fq. user=bsmtp argv=/usr/lib/bsmtp/bsmtp -f $sender $nexthop $recipient
-#
-#scalemail-backend unix -       n       n       -       2       pipe
-#  flags=R user=scalemail argv=/usr/lib/scalemail/bin/scalemail-store
-#  ${nexthop} ${user} ${extension}
-#
-#mailman   unix  -       n       n       -       -       pipe
-#  flags=FRX user=list argv=/usr/lib/mailman/bin/postfix-to-mailman.py
-#  ${nexthop} ${user}
+# ── 11. Future feature helper files ─────────────────────────────────
+log "[11/11] Creating optional future feature notes..."
+cat > /root/mailserver-next-steps.txt <<EOF_NEXT
+Future features to add later:
 
-# SPF policy agent
-policyd-spf  unix  -       n       n       -       0       spawn
-    user=policyd-spf argv=/usr/bin/policyd-spf
-EOF
+1) DKIM key rotation
+   - Generate new selector, e.g. mail2026q3:
+     opendkim-genkey -D /etc/opendkim/keys/${DOMAIN}/ -d ${DOMAIN} -s mail2026q3 -b 2048
+   - Publish mail2026q3._domainkey TXT.
+   - Update /etc/opendkim/KeyTable and SigningTable to new selector.
+   - Keep old DNS selector for a few days before deleting.
 
+2) DANE/TLSA
+   - Only do this if your DNS zone uses DNSSEC.
+   - Generate TLSA for _25._tcp.${HOSTNAME}, then publish it.
+   - Without DNSSEC, DANE does not help.
 
-echo -e "copying config to main.cf... ${NC}"
-cat >> /etc/postfix/main.cf << EOF
-# ── Basic ───────────────────────────────────────────
-smtpd_banner = $myhostname ESMTP
-biff = no
-append_dot_mydomain = no
-readme_directory = no
-compatibility_level = 3.6
+3) Outbound rate limits
+   - Already started in main.cf with conservative smtp_destination_rate_delay and concurrency limits.
+   - Increase slowly only after good reputation.
 
-# ── Hostname & Domain ───────────────────────────────
-myhostname = mail.panwestconsultant.net
-mydomain = panwestconsultant.net
-myorigin = $mydomain
-mydestination = $myhostname, localhost.$mydomain, localhost
+4) Bounce processing
+   - Use Return-Path/bounce mailbox or VERP.
+   - Parse DSNs from /var/mail or a dedicated bounce@ mailbox.
+   - Suppress hard bounces immediately.
 
-# ── Send-Only (loopback-only for inbound) ───────────
-inet_interfaces = all
-inet_protocols = ipv4
+5) Feedback loop handling
+   - Register with supported providers where available.
+   - Gmail does not offer traditional FBL for normal senders; use Postmaster Tools.
 
-# ── Outbound Relay — Direct Delivery ────────────────
-relayhost =
-# No smarthost — deliver directly via DNS MX records
+6) VERP
+   - Use sender addresses like bounce+USERID@${DOMAIN} for list mail.
+   - Requires app-level sender generation plus catch-all/bounce processing.
 
-# ── TLS: Always encrypt outbound ────────────────────
-smtp_tls_security_level = may
-smtp_tls_loglevel = 1
-smtp_tls_session_cache_database = btree:${data_directory}/smtp_scache
-smtp_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
-smtp_tls_mandatory_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
-smtp_tls_mandatory_ciphers = medium
+7) List-Unsubscribe headers
+   - Add in your sending app:
+     List-Unsubscribe: <mailto:unsubscribe@${DOMAIN}>, <https://${DOMAIN}/unsubscribe?id=USERID>
+     List-Unsubscribe-Post: List-Unsubscribe=One-Click
+EOF_NEXT
 
-# ── Message Size ────────────────────────────────────
-message_size_limit = 25600000
-
-# ── DKIM Milter ────────────────────────────────────
-milter_default_action = accept
-milter_protocol = 6
-smtpd_milters = inet:127.0.0.1:8891
-non_smtpd_milters = inet:127.0.0.1:8891
-
-# ── SPF Policy Agent ───────────────────────────────
-policyd-spf_time_limit = 3600
-smtpd_recipient_restrictions =
-    permit_mynetworks,
-    permit_sasl_authenticated,
-    reject_unauth_destination,
-    check_policy_service unix:private/policyd-spf
-
-# ── Rate Limits (prevents abuse spikes) ────────────
-default_destination_concurrency_limit = 20
-default_destination_recipient_limit = 50
-smtp_destination_concurrency_limit = 10
-
-smtpd_sasl_type = cyrus
-smtpd_sasl_path = smtpd
-smtpd_sasl_auth_enable = yes
-broken_sasl_auth_clients = yes
-
-smtpd_tls_auth_only = yes
-
-smtpd_tls_cert_file=/etc/letsencrypt/live/mail.panwestconsultant.net/fullchain.pem
-smtpd_tls_key_file=/etc/letsencrypt/live/mail.panwestconsultant.net/privkey.pem
-smtpd_sasl_security_options = noanonymous
-EOF
-
-echo -e "[4/8] Copying sasl config... ${NC}"
-cat > /etc/default/saslauthd << EOF
-#
-# Settings for saslauthd daemon
-# Please read /usr/share/doc/sasl2-bin/README.Debian.gz for details.
-#
-START=yes
-# Description of this saslauthd instance. Recommended.
-# (suggestion: SASL Authentication Daemon)
-DESC="SASL Authentication Daemon"
-
-# Short name of this saslauthd instance. Strongly recommended.
-# (suggestion: saslauthd)
-NAME="saslauthd"
-
-# Which authentication mechanisms should saslauthd use? (default: pam)
-#
-# Available options in this Debian package:
-# getpwent  -- use the getpwent() library function
-# kerberos5 -- use Kerberos 5
-# pam       -- use PAM
-# rimap     -- use a remote IMAP server
-# shadow    -- use the local shadow password file
-# sasldb    -- use the local sasldb database file
-# ldap      -- use LDAP (configuration is in /etc/saslauthd.conf)
-#
-# Only one option may be used at a time. See the saslauthd man page
-# for more information.
-#
-# Example: MECHANISMS="pam"
-MECHANISMS="pam"
-
-# Additional options for this mechanism. (default: none)
-# See the saslauthd man page for information about mech-specific options.
-MECH_OPTIONS=""
-
-# How many saslauthd processes should we run? (default: 5)
-# A value of 0 will fork a new process for each connection.
-THREADS=5
-
-# Other options (default: -c -m /var/run/saslauthd)
-# Note: You MUST specify the -m option or saslauthd won't run!
-#
-# WARNING: DO NOT SPECIFY THE -d OPTION.
-# The -d option will cause saslauthd to run in the foreground instead of as
-# a daemon. This will PREVENT YOUR SYSTEM FROM BOOTING PROPERLY. If you wish
-# to run saslauthd in debug mode, please run it by hand to be safe.
-#
-# See the saslauthd man page and the output of 'saslauthd -h' for general
-# information about these options.
-#
-# Example for chroot Postfix users: "-c -m /var/spool/postfix/var/run/saslauthd"
-# Example for non-chroot Postfix users: "-c -m /var/run/saslauthd"
-#
-# To know if your Postfix is running chroot, check /etc/postfix/master.cf.
-# If it has the line "smtp inet n - y - - smtpd" or "smtp inet n - - - - smtpd"
-# then your Postfix is running in a chroot.
-# If it has the line "smtp inet n - n - - smtpd" then your Postfix is NOT
-# running in a chroo
-OPTIONS="-c -m /run/saslauthd"
-EOF
-
-echo -e "\n${YELLOW}[5/8] Restarting saslauthd... ${NC}"
-sudo systemctl restart saslauthd
-systemctl status saslauthd --no-pager -l
-
-echo -e "\n${YELLOW}[6/8] Creating saslauthd user... ${NC}"
-sudo adduser smtpuser --disabled-password --gecos ""
-echo "smtpuser:strongpassword" | sudo chpasswd
-testsaslauthd -u smtpuser -p strongpassword
-
-echo -e "\n${YELLOW}[7/8] Opening firewall ports... ${NC}"
-sudo ufw allow 587/tcp
-sudo ufw allow 465/tcp
-
-echo -e "\n${YELLOW}[8/8] Restarting postfix... ${NC}"
-sudo systemctl restart saslauthd
-sudo systemctl restart postfix
-
-
-# ── 10. Summary ─────────────────────────────────────────────────────
-echo -e "\n${GREEN}========================================${NC}"
-echo -e "${GREEN}  SETUP COMPLETE${NC}"
-echo -e "${GREEN}========================================${NC}"
+ok "========================================"
+ok " SETUP COMPLETE"
+ok "========================================"
+echo "Hostname:      ${HOSTNAME}"
+echo "Domain:        ${DOMAIN}"
+echo "Server IP:     ${SERVER_IP}"
+echo "SMTP user:     ${SMTP_USER}"
+echo "SMTP host:     ${HOSTNAME}"
+echo "SMTP port:     587 STARTTLS Required"
 echo ""
-echo -e "Hostname:       ${HOSTNAME}"
-echo -e "Domain:         ${DOMAIN}"
-echo -e "DKIM Selector:  ${SELECTOR}"
-echo -e "Server IP:      $(ip route get 1 | awk '{print $7; exit}')"
+echo -e "${YELLOW}DNS RECORDS TO ADD / VERIFY:${NC}"
+echo "A      mail        ${SERVER_IP}"
+echo "MX     @           10 ${HOSTNAME}"
+echo "TXT    @           v=spf1 mx a ip4:${SERVER_IP} ~all"
+echo "TXT    mail        v=spf1 a -all"
+echo "TXT    _dmarc      v=DMARC1; p=quarantine; rua=mailto:${ADMIN_EMAIL}; ruf=mailto:${ADMIN_EMAIL}; fo=1"
+echo "TXT    _mta-sts    v=STSv1; id=$(date +%Y%m%d)"
+echo "TXT    _smtp._tls  v=TLSRPTv1; rua=mailto:${ADMIN_EMAIL}"
+echo "A      mta-sts     ${SERVER_IP}"
+echo "PTR/rDNS in VPS panel: ${HOSTNAME}"
 echo ""
-echo -e "${YELLOW}NEXT STEPS — DO THESE MANUALLY IN YOUR DNS PROVIDER:${NC}"
+echo -e "${YELLOW}DKIM TXT — publish this cleanly as one TXT value, no tabs/escaped \\009:${NC}"
+cat "/etc/opendkim/keys/${DOMAIN}/${SELECTOR}.txt"
 echo ""
-echo "──────────────────────────────────────────────"
-echo "1. A RECORD"
-echo "   Host: mail"
-echo "   Type: A"
-echo "   Value: $(ip route get 1 | awk '{print $7; exit}')"
+echo -e "${YELLOW}Verify:${NC}"
+echo "dig A ${HOSTNAME}"
+echo "dig MX ${DOMAIN}"
+echo "dig TXT ${DOMAIN}"
+echo "dig TXT mail.${DOMAIN}"
+echo "dig TXT ${SELECTOR}._domainkey.${DOMAIN}"
+echo "dig TXT _dmarc.${DOMAIN}"
+echo "dig TXT _mta-sts.${DOMAIN}"
+echo "dig TXT _smtp._tls.${DOMAIN}"
+echo "curl -s https://${MTA_STS_HOST}/.well-known/mta-sts.txt"
+echo "openssl s_client -starttls smtp -connect ${HOSTNAME}:587 -servername ${HOSTNAME}"
 echo ""
-echo "2. MX RECORD"
-echo "   Host: @"
-echo "   Type: MX"
-echo "   Priority: 10"
-echo "   Value: ${HOSTNAME}"
+echo -e "${YELLOW}Client SMTP settings:${NC}"
+echo "Host: ${HOSTNAME}"
+echo "Port: 587"
+echo "Encryption: Required / STARTTLS"
+echo "Username: ${SMTP_USER}"
+echo "Password: [the password you set in this script]"
 echo ""
-echo "3. SPF RECORD"
-echo "   Host: @"
-echo "   Type: TXT"
-echo "   Value: v=spf1 mx a:${HOSTNAME} ~all"
-echo ""
-echo "4. DKIM RECORD (from the key shown above)"
-echo "   Host: ${SELECTOR}._domainkey"
-echo "   Type: TXT"
-echo "   Value: (paste the content between the quotes from above)"
-echo ""
-echo "5. DMARC RECORD"
-echo "   Host: _dmarc"
-echo "   Type: TXT"
-echo "   Value: v=DMARC1; p=quarantine; rua=mailto:${ADMIN_EMAIL}; ruf=mailto:${ADMIN_EMAIL}; fo=1"
-echo ""
-echo "6. rDNS / PTR RECORD (IN YOUR VPS PROVIDER'S PANEL)"
-echo "   Set the reverse DNS of your IP to: ${HOSTNAME}"
-echo ""
-echo "7. OUTBOUND PORT 25 CHECK"
-echo "   Hetzner: blocks port 25 outbound for ~1 month / until first paid invoice."
-echo "   Contabo: port 25 is open by default."
-echo "   DigitalOcean/Vultr: may block — check their policy."
-echo "   Confirm with: nc -zv gmail-smtp-in.l.google.com 25"
-echo ""
-echo "8. MTA-STS TXT RECORD (OPTIONAL, FOR ENHANCED SECURITY)"
-echo "   Type: TXT"
-echo "   Host: _mta-sts"
-echo "   Value: v=STSv1; id=20260513"
-echo ""
-echo "9. TLS reporting TXT RECORD (OPTIONAL, FOR ENHANCED SECURITY)"
-echo "   Type: TXT"
-echo "   Host: _smtp._tls"
-echo "   Value: v=TLSRPTv1; rua=mailto:contact@panwestconsultant.net"
-echo ""
-echo "10. Create hostname for policy server (OPTIONAL, FOR ENHANCED SECURITY)"
-echo "   Type: A"
-echo "   Host: mta-sts"
-echo "   Value: 51.255.199.110"
-echo ""
-echo -e "${YELLOW}After adding DNS records, verify with:${NC}"
-echo "  dig A ${HOSTNAME}"
-echo "  dig MX ${DOMAIN}"
-echo "  dig TXT ${DOMAIN}            # SPF"
-echo "  dig TXT ${SELECTOR}._domainkey.${DOMAIN}   # DKIM"
-echo "  dig TXT _dmarc.${DOMAIN}    # DMARC"
-echo "  dig -x $(ip route get 1 | awk '{print $7; exit}')   # rDNS/PTR"
-echo ""
-echo -e "${YELLOW}verify mta sts:${NC}"
-echo "  dig TXT _mta-sts.${DOMAIN}"
-echo "  dig TXT _smtp._tls.${DOMAIN}"
-echo "  visit https://mta-sts.${DOMAIN}/.well-known/mta-sts.txt"
-echo " you will seee"
-echo "version: STSv1"
-echo "mode: enforce"
-echo "mx: mail.${DOMAIN}"
-echo "max_age: 86400"
-echo ""
-
-echo -e "${YELLOW}Send a test email:${NC}"
-echo '  echo "Test body" | mail -s "Test Subject" your-email@gmail.com'
-echo ""
-echo -e "${YELLOW}Check mail logs:${NC}"
-echo "  tail -f /var/log/mail.log"
+echo "Future notes saved to: /root/mailserver-next-steps.txt"
